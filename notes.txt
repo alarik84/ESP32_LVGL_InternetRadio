@@ -1,0 +1,137 @@
+// Callback przełączania ekranu na DLNA
+static void lvgl_change_to_dlna_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED)
+    {
+        // Jeśli ekran DLNA nie był jeszcze zbudowany, budujemy go
+        if(scrDlna == NULL) {
+            dlnaScreenCreate();
+        }
+        // Przełączenie widoku na DLNA z ładną animacją zanikania (czas: 300ms)
+        lv_screen_load_anim(scrDlna, LV_SCREEN_LOAD_ANIM_FADE_ON, 300, 0, false);
+    }
+}
+
+
+
+// Pomocniczy wątek tła do pobrania listy bez zamrażania ekranu
+void TaskFetchDlna(void * pvParameters) {
+    discoverDlnaResources(); // Pobieramy dane z sieci lokalnej
+    
+    // Po pobraniu danych, odświeżamy listę w LVGL
+    if (dlnaListWidget != NULL) {
+        lv_obj_clean(dlnaListWidget); // Czyścimy starą listę
+        for (intptr_t i = 0; i < dlnaTrackCount; i++) {
+            lv_obj_t * btn = lv_list_add_button(dlnaListWidget, LV_SYMBOL_AUDIO, dlnaTracks[i].title.c_str());
+            lv_obj_add_event_cb(btn, lvgl_dlna_item_event_cb, LV_EVENT_CLICKED, (void*)i);
+        }
+    }
+    vTaskDelete(NULL); // Usuwamy zadanie po zakończeniu pracy
+}
+
+// Zmodyfikowana funkcja budowania widgetów
+inline void createDlnaListWidget(lv_obj_t* currentScreen)
+{
+    dlnaListWidget = lv_list_create(currentScreen);
+    lv_obj_set_size(dlnaListWidget, 240, 180);
+    lv_obj_align(dlnaListWidget, LV_ALIGN_TOP_LEFT, 20, 50);
+
+    // Zamiast blokować pętlę, odpalamy pobieranie w tle na Rdzeniu 0 z niskim priorytetem
+    xTaskCreatePinnedToCore(TaskFetchDlna, "DlnaFetch", 5000, NULL, 1, NULL, 0);
+}
+
+
+#include <HTTPClient.h>
+
+// Wprowadź IP oraz port swojego domowego serwera DLNA
+const char* dlnaServerIP = "192.168.1.100"; 
+const int dlnaServerPort = 8200;
+
+// Funkcja wysyłająca zapytanie SOAP do ContentDirectory serwera DLNA
+inline void discoverDlnaResources()
+{
+    dlnaTrackCount = 0; // Resetujemy licznik przed nowym wyszukiwaniem
+
+    if (WiFi.status() != WL_CONNECTED) {
+        debugPrint("DLNA: Brak połączenia z Wi-Fi!");
+        return;
+    }
+
+    HTTPClient http;
+    
+    // Budujemy adres URL usługi ContentDirectory (najczęstsza ścieżka w serwerach DLNA)
+    String url = "http://" + String(dlnaServerIP) + ":" + String(dlnaServerPort) + "/ctl/ContentDir";
+    http.begin(url);
+    
+    // DLNA wymaga specyficznych nagłówków HTTP oraz typu Content-Type text/xml
+    http.addHeader("Content-Type", "text/xml; charset=\"utf-8\"");
+    http.addHeader("SOAPACTION", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"");
+
+    // Ciało zapytania (SOAP XML) - akcja Browse. 
+    // ObjectID "0" oznacza główny katalog root serwera. "A_ARG_TYPE_BrowseFlag" to BrowseDirectChildren
+    String soapBody = 
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<s:Envelope xmlns:s=\"http://xmlsoap.org\" s:encodingStyle=\"http://xmlsoap.org\">"
+        "  <s:Body>"
+        "    <u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">"
+        "      <ObjectID>0</ObjectID>"
+        "      <BrowseFlag>BrowseDirectChildren</BrowseFlag>"
+        "      <Filter>*</Filter>"
+        "      <StartingIndex>0</StartingIndex>"
+        "      <RequestedCount>30</RequestedCount>"
+        "      <SortCriteria></SortCriteria>"
+        "    </u:Browse>"
+        "  </s:Body>"
+        "</s:Envelope>";
+
+    debugPrint("DLNA: Wysyłanie zapytania do serwera...");
+    int httpCode = http.POST(soapBody);
+
+    if (httpCode == HTTP_CODE_OK) {
+        String response = http.getString();
+        
+        // PARSER XML (DIDL-Lite)
+        // Szukamy w tekście znaczników utworów i linków HTTP metodą przeszukiwania stringów,
+        // aby nie obciążać pamięci RAM ESP32 ciężkimi parserami XML.
+        int pos = 0;
+        while (dlnaTrackCount < 30) {
+            // 1. Szukamy początku elementu i jego tytułu
+            int itemPos = response.indexOf("<item id=", pos);
+            if (itemPos == -1) break; // Brak kolejnych utworów
+
+            int titleStart = response.indexOf("<dc:title>", itemPos);
+            if (titleStart == -1) break;
+            titleStart += 10; // Przesunięcie o długość tagu <dc:title>
+            int titleEnd = response.indexOf("</dc:title>", titleStart);
+
+            // 2. Szukamy bezpośredniego adresu URL do pliku MP3
+            int resStart = response.indexOf("<res ", titleEnd);
+            if (resStart == -1) break;
+            resStart = response.indexOf("http://", resStart); // Szukamy początku adresu linku
+            int resEnd = response.indexOf("</res>", resStart);
+
+            if (titleEnd > titleStart && resEnd > resStart) {
+                // Wycinamy dane z XML
+                String title = response.substring(titleStart, titleEnd);
+                String mp3Url = response.substring(resStart, resEnd);
+
+                // Zapisujemy utwór do naszej struktury LVGL
+                dlnaTracks[dlnaTrackCount].title = title;
+                dlnaTracks[dlnaTrackCount].url = mp3Url;
+                
+                dlnaTrackCount++;
+                pos = resEnd; // Przesuwamy kursor parsera dalej
+            } else {
+                pos = itemPos + 10;
+            }
+        }
+        debugPrint("DLNA: Pomyślnie pobrano utworów: ");
+        debugPrint(dlnaTrackCount);
+    } 
+    else {
+        debugPrint("DLNA: Błąd połączenia HTTP, kod błędu: ");
+        debugPrint(httpCode);
+    }
+    
+    http.end(); // Zamykamy gniazdo HTTP
+}
