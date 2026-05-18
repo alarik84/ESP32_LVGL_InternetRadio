@@ -1,0 +1,373 @@
+#pragma once
+
+// #define DEV_DEVICE_PINS
+
+// Button
+// #define BTN_A 0
+
+// Display
+
+// I2C
+#define I2C_SUPPORTED
+#define I2C_SDA 8
+#define I2C_SCL 4
+#define I2C_FREQ 400000UL
+
+#include <Arduino.h>
+#include <SD.h>
+#include <TAMC_GT911.h>
+#include <Arduino_GFX_Library.h>
+#include <ESP32Time.h>
+#include <esp_sntp.h>
+#include <time.h>
+
+template <typename T>
+void debugPrint(T announce) {
+    #ifdef DEBUG_MODE
+    Serial.println(announce);
+    #endif
+}
+
+class JC4827W543
+{
+public:
+    struct touch
+    {
+        uint16_t x;
+        uint16_t y;
+        uint8_t pressure;
+    };
+    uint16_t getScreenWidth{
+        tft_orientation == 1 ? tft_height : tft_width};
+    uint16_t getScreenHight{
+        tft_orientation == 1 ? tft_width : tft_height};
+
+private:
+    // screens
+    // static uint8_t constexpr display_orientation = 0;
+    static uint16_t constexpr tft_width = 480;
+    static uint16_t constexpr tft_height = 272;
+    static uint8_t constexpr tft_orientation = 0; // native orientation is landscape
+    static uint8_t constexpr tft_cs = 45;
+    static uint8_t constexpr tft_sck = 47;
+    static uint8_t constexpr tft_d0 = 21;
+    static uint8_t constexpr tft_d1 = 48;
+    static uint8_t constexpr tft_d2 = 40;
+    static uint8_t constexpr tft_d3 = 39;
+    static uint8_t constexpr tft_bl = 1;
+    static uint32_t constexpr nv3041a_max_clock_freq = 32000000;
+    // SD card
+    static uint8_t constexpr sd_mosi = 11;
+    static uint8_t constexpr sd_miso = 13;
+    static uint8_t constexpr sd_sck = 12;
+    static uint8_t constexpr sd_cs = 10;
+    // Touch
+    static uint8_t constexpr touch_irq = 3;
+    static uint8_t constexpr touch_sda = 8;
+    static uint8_t constexpr touch_sck = 4;
+    static uint8_t constexpr touch_rst = 38;
+    // I2S Internal sound
+    static int8_t constexpr sound_mck = -1;
+    static uint8_t constexpr sound_bck = 42;
+    static uint8_t constexpr sound_lck = 2;
+    static uint8_t constexpr sound_dot = 41;
+    static int8_t constexpr sound_din = -1;
+    static float constexpr sound_gain_level = 0.5;
+    static uint8_t constexpr output_num = I2S_NUM_0;
+    // I2S external sound module PCM5102A CJMCU - 5102
+    static int8_t constexpr sound_ext_dot = 15;
+    static uint8_t constexpr sound_ext_bck = 16;
+    static uint8_t constexpr sound_ext_lck = 7;
+
+    const char *TZ_INFO = "CET-1CEST-2,M3.5.0/02:00:00,M10.5.0/03:00:00";
+
+    const char *_hostName;
+    const char *_wifiName;
+    const char *_wifiPasswd;
+
+protected:
+    const char *sdMountPoint = "/sdcard";
+
+    ESP32Time rtc; // offset in seconds GMT+1
+
+    SPIClass spiSD{HSPI};
+
+    TAMC_GT911 touch_screen = TAMC_GT911(
+        touch_sda,
+        touch_sck,
+        touch_irq,
+        touch_rst,
+        tft_orientation == 1 ? tft_height : tft_width,
+        tft_orientation == 1 ? tft_width : tft_height);
+
+    Arduino_DataBus *bus = new Arduino_ESP32QSPI(
+        tft_cs /* cs */, tft_sck /* sck */, tft_d0 /* d0 */, tft_d1 /* d1 */, tft_d2 /* d2 */, tft_d3 /* d3 */);
+
+    Arduino_NV3041A *_gfx = new Arduino_NV3041A(bus, GFX_NOT_DEFINED /* RST */, tft_orientation /* rotation */, true /* IPS */);
+
+    Audio audio_;
+
+    void init_touch_screen()
+    {
+
+        // note: cold boot sometimes does not reset the i2c device
+        //       reset using button sometimes fails
+        //       the reset procedure below fixes that
+        //       see: https://www.crystalfontz.com/controllers/GOODIX/GT911/
+        //            page 10
+
+        // GT911 hardware reset sequence
+        pinMode(touch_rst, OUTPUT);
+        pinMode(touch_irq, OUTPUT);
+
+        digitalWrite(touch_rst, LOW);
+        digitalWrite(touch_irq, LOW);
+        delayMicroseconds(200); // min 100us
+
+        digitalWrite(touch_irq, LOW);
+        // INT high or low sets I2C address to 0x5D or 0x14
+        // manual does not make clear which is which
+        // through experimenting correct is: low
+        // driver assumes 0x5D
+        delayMicroseconds(200); // min 100us
+
+        digitalWrite(touch_rst, HIGH);
+        delay(10); // min 5ms
+
+        digitalWrite(touch_irq, LOW);
+        delay(100); // min 50ms
+
+        pinMode(touch_irq, INPUT);
+
+        touch_screen.begin();
+
+        if (tft_orientation == 0)
+        {
+            touch_screen.setRotation(ROTATION_INVERTED);
+        }
+        else
+        {
+            touch_screen.setRotation(ROTATION_RIGHT);
+        }
+    }
+
+    void SDcardInit()
+    {
+        spiSD.begin(sd_sck, sd_miso, sd_mosi, sd_cs);
+
+        delay(500);
+        while (!SD.begin(sd_cs, spiSD, 10000000, sdMountPoint))
+        {
+            delay(50);
+        }
+    }
+    void GarphicInit()
+    {
+        // Init Display
+        if (!_gfx->begin(nv3041a_max_clock_freq))
+        {
+            debugPrint("gfx->begin() failed!");
+            while (true)
+            {
+                /* no need to continue */
+            }
+        }
+        // Set the backlight of the screen to High intensity
+        pinMode(tft_bl, OUTPUT);
+        digitalWrite(tft_bl, HIGH);
+        _gfx->fillScreen(RGB565_BLACK);
+    }
+
+    void SoundInit()
+    {
+        audio_.setPinout(sound_ext_bck, sound_ext_lck, sound_ext_dot);
+        audio_.setVolume(8); // set inital volume, range 0...21
+    }
+
+    void initNTP(const char *ntpServer1, const char *ntpServer2, const char *ntpServer3)
+    {
+        sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+        // sntp_set_time_sync_notification_cb(cbSyncTime);
+        sntp_set_sync_interval(12 * 60 * 60 * 1000UL); // 12 hours, not working.
+        configTime(3600, 3600, ntpServer1, ntpServer2, ntpServer3);
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo))
+        {
+            rtc.setTimeStruct(timeinfo);
+        }
+    }
+
+    void connectToWiFi(const char *hostName, const char *WifiName, const char *WifiPasswd)
+    {
+        _hostName = hostName;
+        _wifiName = WifiName;
+        _wifiPasswd = WifiPasswd;
+        debugPrint("Connecting to Wi-Fi");
+        WiFi.hostname(_hostName);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(_wifiName, _wifiPasswd);
+        uint8_t WiFi_timeout_count = 0;
+        while (WiFi.status() != WL_CONNECTED && WiFi_timeout_count < 25)
+        {
+            delay(500);
+            debugPrint(".");
+            // WiFi_timeout_count++;
+        }
+        debugPrint("\nWi-Fi connected!");
+        debugPrint(WiFi.localIP());
+    }
+
+public:
+    void init(bool graphic = true, bool touchScreen = true, bool SDCard = true, bool sound = true)
+    {
+#ifdef DEBUG_MODE
+        Serial.begin(115200);
+        uint32_t startTime = millis();
+        while (!Serial && (millis() - startTime < 5000))
+        {
+            delay(100);
+        }
+#endif
+        if (SDCard)
+        {
+            SDcardInit();
+        }
+        if (touchScreen)
+        {
+            init_touch_screen();
+        }
+        if (graphic)
+        {
+            GarphicInit();
+        }
+        if (sound)
+        {
+            SoundInit();
+        }
+    }
+
+    void wifiInit(const char *hostName, const char *WifiName, const char *WifiPasswd)
+    {
+        connectToWiFi(hostName, WifiName, WifiPasswd);
+    }
+
+    void wifiCheck()
+    {
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            #ifdef DEBUG_MODE
+                debugPrint("Wifi not connected retrying connection...");
+            #endif
+            WiFi.disconnect();
+            wifiInit(_hostName, _wifiName, _wifiPasswd);
+        }
+    }
+
+    void ntpInit(const char *ntpServer1, const char *ntpServer2, const char *ntpServer3)
+    {
+        initNTP(ntpServer1, ntpServer2, ntpServer3);
+    }
+
+    void audio_connectToHost(const char *url)
+    {
+        uint8_t initialVolume = audio_.getVolume();
+        audio_.stopSong();
+        audio_.setVolume(0);
+        delay(500);
+        audio_.connecttohost(url);
+        audio_.setVolume(initialVolume);
+    }
+
+    void audio_stop()
+    {
+        audio_.stopSong();
+    }
+
+    void audio_pasueResume()
+    {
+        audio_.pauseResume();
+    }
+
+    bool audio_isRunning()
+    {
+        return audio_.isRunning();
+    }
+
+    void audio_setVolume(uint8_t level)
+    {
+        audio_.setVolume(level);
+    }
+
+    uint8_t audio_getVolume()
+    {
+        return audio_.getVolume();
+    }
+
+    void audio_loop()
+    {
+        audio_.loop();
+    }
+
+    bool display_is_touched()
+    {
+        touch_screen.read();
+        return touch_screen.isTouched;
+    }
+
+    uint8_t display_touch_count()
+    {
+        return touch_screen.touches;
+    }
+
+    void display_get_touch(touch touches[])
+    {
+        for (int i = 0; i < touch_screen.touches; ++i)
+        {
+            touches[i].x = touch_screen.points[i].x;
+            touches[i].y = touch_screen.points[i].y;
+            touches[i].pressure = touch_screen.points[i].size;
+        }
+    }
+
+    uint8_t SD_GetCardType()
+    {
+        return SD.cardType();
+    }
+
+    File SD_FileOpen(char *filePath)
+    {
+        return SD.open(filePath);
+    }
+
+    Arduino_NV3041A graphic()
+    {
+        return *_gfx;
+    }
+
+    void graphic_backlight(bool enabled = true)
+    {
+        if (enabled)
+        {
+            if (digitalRead(tft_bl) == LOW)
+            {
+                digitalWrite(tft_bl, HIGH);
+            }
+        }
+        else
+        {
+            if (digitalRead(tft_bl) == HIGH)
+            {
+                digitalWrite(tft_bl, LOW);
+            }
+        }
+    }
+
+    String timeGet(String timeFormat)
+    {
+        return rtc.getTime(timeFormat);
+    }
+
+    void graphic_backlightBrightness(uint8_t brightness)
+    {
+    }
+};
