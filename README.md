@@ -18,4 +18,16 @@ PCM5102A DIN = ESP32 2
 
 PCM5102A LCK = ESP32 15
 
+How to configure:
+Create src/app/secrets.h:
+//-------------------------------------------------
+const char *WIFIName = "Your Wifi name"
+const char *WIFIPasswd = "Your Wifi password"
+const char *otaPassword = "Pablo8846!";
+
+const char* timeServer1 = "time server 1";
+const char* timeServer2 = "time server 2";
+const char* timeServer3 = "time server 3";
+//-------------------------------------------------
+
 I'm new in C++ so don't hesitate to give me advices. Cheers :)
